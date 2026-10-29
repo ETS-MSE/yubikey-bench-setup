@@ -8,7 +8,7 @@ provisioning laptop to prepare the YubiKeys used at the device-provisioning benc
 Open **Windows Terminal** (Windows PowerShell 5.1 or PowerShell 7) and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.0.0/Setup-YubiKeys.ps1 | iex
+irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.1.0/Setup-YubiKeys.ps1 | iex
 ```
 
 The address names a release tag, so the line always runs the same reviewed copy. Each new version gets a
@@ -22,7 +22,11 @@ winget install --id Yubico.YubiKeyManagerCLI -e
 
 ## What it does
 
-For each key, one at a time, it reads what a short press and a long press type today, then:
+First it asks for one sign-in, the same one the bench uses: a long press of your own enrolled key, or the
+pilot code while pilot mode is open. That sign-in is what allows the session to enrol keys. Press Enter
+alone to set keys up without enrolling them. Enrolling works only on the ETS office network.
+
+Then, for each key, one at a time, it reads what a short press and a long press type today, then:
 
 | What the presses typed | What the script does |
 |---|---|
@@ -31,8 +35,10 @@ For each key, one at a time, it reads what a short press and a long press type t
 | short: a code, long: something else | Asks first; type `OVERWRITE` to replace it |
 | no Yubico code on either press | Set it aside: it can never sign in at the bench |
 
-It then proves both presses and appends the key's serial, public id and holder to
-`yubikeys-<date>.csv` on the Desktop.
+It then proves both presses, asks who will carry the key, and **enrols it there and then**: from that
+moment its long press signs in at the bench. Nothing is written to disk and there is no file to send
+anyone. A key left without a holder is a spare; run the script again with it when it is handed to someone.
+Enrolment only ever adds a key: one already enrolled to someone else, or disabled, is refused.
 
 It touches **only the two OTP slots**. FIDO2, passkeys, PIV / smart card and OATH on the key are not
 read or changed. It contains no secret: the only value it writes is the bench start command, which is
@@ -42,6 +48,7 @@ what a short press of a set-up key types anyway.
 
 | Release | File | SHA-256 |
 |---|---|---|
+| v1.1.0 | `Setup-YubiKeys.ps1` | `6bb23493630946db4029c4fae3a7067a5392aeb6671732bda577bf98b01d3667` |
 | v1.0.0 | `Setup-YubiKeys.ps1` | `a88414f695a5f620bf4bb787e4ed2de8d4cdad37e656f957a297a538f0f35b37` |
 
 ```powershell
