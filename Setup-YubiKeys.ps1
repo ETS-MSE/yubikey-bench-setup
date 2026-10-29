@@ -18,7 +18,9 @@
     The provisioning service answers only the office network, so enrol in the office. A key set up
     elsewhere still gets its short press; run this again in the office to enrol it.
 
-    Needs the YubiKey Manager CLI (ykman):  winget install --id Yubico.YubiKeyManagerCLI -e
+    It needs the YubiKey Manager CLI (ykman) and installs it itself the first time: the newest x64
+    installer from developers.yubico.com, run only if Windows confirms it is signed by Yubico AB.
+    Windows asks once to allow that install unless the window is already elevated.
     The laptop's keyboard layout must be English (US), the same as the bench's first setup screen.
 
     The FIDO2 / passkey / smart-card parts of a key are NOT touched -- only the two OTP slots.
@@ -28,7 +30,7 @@
     The provisioning service. Default: the production one. Office network only.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.1.0/Setup-YubiKeys.ps1 | iex
+    irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.2.0/Setup-YubiKeys.ps1 | iex
     Runs the published copy from Windows Terminal (Windows PowerShell or PowerShell 7), on any network.
 
 .EXAMPLE
@@ -49,16 +51,91 @@ $OldCommand = 'curl https://p.exchangetech.ca/b|cmd'
 # A Yubico OTP: modhex letters only, 44 long (12 public id + 32).
 $OtpPattern = '^[cbdefghijklnrtuv]{44}$'
 
+# The oldest ykman this script is written against. A missing or older one is replaced by the newest.
+$YkmanFloor   = [version]'5.0.0'
+# Yubico's own release folder for the YubiKey Manager CLI; the signed Windows installer is published here.
+$YkmanReleases = 'https://developers.yubico.com/yubikey-manager/Releases/'
+
+function Get-YkmanVersion {
+    param([string]$Path)
+    $ErrorActionPreference = 'Continue'
+    $out = & $Path --version 2>&1 | ForEach-Object { "$_" } | Out-String
+    if ($out -match '(\d+\.\d+\.\d+)') { return [version]$Matches[1] }
+    return $null
+}
+
 function Find-Ykman {
+    # Every ykman.exe on the laptop, and the newest of them: one on PATH (pip, an old install) can be
+    # older than the one the installer has just put in Program Files.
+    $paths = @()
     $c = Get-Command ykman.exe -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
+    if ($c) { $paths += $c.Source }
     foreach ($root in @("$env:ProgramFiles\Yubico", "${env:ProgramFiles(x86)}\Yubico")) {
-        if (Test-Path $root) {
-            $f = Get-ChildItem -Path $root -Filter ykman.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($f) { return $f.FullName }
+        if ($root -and (Test-Path $root)) {
+            $paths += @(Get-ChildItem -Path $root -Filter ykman.exe -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
         }
     }
-    return $null
+    $best = $null
+    foreach ($p in ($paths | Select-Object -Unique)) {
+        $v = Get-YkmanVersion $p
+        if ($v -and (-not $best -or $v -gt $best.Version)) { $best = @{ Path = $p; Version = $v } }
+    }
+    return $best
+}
+
+function Install-Ykman {
+    # The newest x64 installer Yubico publishes, from Yubico itself; run only if Windows says it is
+    # signed by Yubico AB. Returns $true when msiexec reports success.
+    $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell 5.1 downloads ~10x slower with the bar
+    $page = Invoke-WebRequest -Uri $YkmanReleases -UseBasicParsing
+    $newest = [regex]::Matches($page.Content, 'yubikey-manager-(\d+\.\d+\.\d+)-win64\.msi(?!\.sig)') |
+        ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1
+    if (-not $newest) {
+        Write-Host "  Could not find the ykman installer on $YkmanReleases" -ForegroundColor Red
+        return $false
+    }
+    $name = "yubikey-manager-$newest-win64.msi"
+    $dir  = Join-Path $env:TEMP ('ets-ykman-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    $msi  = Join-Path $dir $name
+    $log  = Join-Path $dir 'install.log'
+    $ok   = $false
+    try {
+        Write-Host "  Downloading $name from Yubico ..."
+        Invoke-WebRequest -Uri ($YkmanReleases + $name) -OutFile $msi -UseBasicParsing
+        $sig = Get-AuthenticodeSignature -FilePath $msi
+        $signer = '(none)'
+        if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+        if ($sig.Status -ne 'Valid' -or $signer -notmatch '(^|,\s*)O=Yubico AB(,|$)') {
+            Write-Host "  REFUSED: the download is not validly signed by Yubico AB (signature $($sig.Status), signer $signer)." -ForegroundColor Red
+            Write-Host '  Nothing was installed.' -ForegroundColor Red
+            return $false
+        }
+        Write-Host "  Signature: Valid, signed by Yubico AB. Installing ykman $newest ..."
+        $msiArgs = @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+        $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($admin) {
+            $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+        } else {
+            Write-Host '  Windows will ask to allow the install (once per laptop): choose Yes.' -ForegroundColor Yellow
+            try {
+                $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Verb RunAs -Wait -PassThru
+            } catch {
+                Write-Host '  The install was not allowed, so ykman is still missing. Run the line again and choose Yes.' -ForegroundColor Red
+                return $false
+            }
+        }
+        # 3010: installed, a restart is pending -- ykman works without it.
+        if ($proc.ExitCode -notin @(0, 3010)) {
+            Write-Host "  The ykman installer failed (msiexec exit $($proc.ExitCode)). Its log is kept at $log" -ForegroundColor Red
+            return $false
+        }
+        $ok = $true
+        return $true
+    } finally {
+        if ($ok) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+        else     { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Invoke-Ykman {
@@ -219,17 +296,25 @@ function Register-Key {
 }
 
 # ------------------------------------------------------------------------------------------- main
-$script:Ykman = Find-Ykman
-if (-not $script:Ykman) {
-    Write-Host 'YubiKey Manager CLI (ykman) is not installed. Install it, then run this again:' -ForegroundColor Red
-    Write-Host '    winget install --id Yubico.YubiKeyManagerCLI -e'
-    # return, not exit: run as `irm ... | iex`, exit would close the technician's window.
-    return
-}
-$lang = (Get-WinUserLanguageList)[0]
 Write-Host ''
 Write-Host '  ETS bench YubiKey setup' -ForegroundColor Cyan
-Write-Host "  ykman:  $script:Ykman"
+$yk = Find-Ykman
+if (-not $yk -or $yk.Version -lt $YkmanFloor) {
+    if ($yk) { Write-Host "  ykman $($yk.Version) is older than $YkmanFloor; installing the newest from Yubico." }
+    else     { Write-Host '  The YubiKey Manager CLI (ykman) is not on this laptop yet; installing it from Yubico (once per laptop).' }
+    $installed = $false
+    try { $installed = Install-Ykman }
+    catch { Write-Host "  Could not install ykman: $($_.Exception.Message)" -ForegroundColor Red }
+    if ($installed) { $yk = Find-Ykman }
+    if (-not $yk -or $yk.Version -lt $YkmanFloor) {
+        Write-Host '  ykman is not ready, so no key was touched. Run the line again; if it fails twice, call the operator.' -ForegroundColor Red
+        # return, not exit: run as `irm ... | iex`, exit would close the technician's window.
+        return
+    }
+}
+$script:Ykman = $yk.Path
+$lang = (Get-WinUserLanguageList)[0]
+Write-Host "  ykman:  $($yk.Version) at $script:Ykman"
 Write-Host "  start command a short press will type: $Command"
 # 00000409 is the US layout, whatever the language (en-US 0409:00000409, en-CA 1009:00000409).
 if (-not ($lang.InputMethodTips | Where-Object { $_ -like '*:00000409' })) {
