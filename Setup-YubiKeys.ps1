@@ -3,13 +3,19 @@
     Set up ETS bench YubiKeys, one after another, on the dedicated Windows 11 provisioning laptop.
 
 .DESCRIPTION
-    For each key it:
+    It finds every YubiKey plugged in itself and lists them NUMBERED; the list follows keys as they
+    are plugged in and out, live. The technician types the number of the key to work on; every ykman
+    call then names that key by its serial (--device), and the technician is told exactly which key
+    to touch. After a key is done the live list comes back.
+
+    For the key picked it:
       1. REPORTS what it sees, in full: the USB device Windows sees (Yubico, vendor 1050, and what its
          product number means), what ykman says about the key (model, serial, firmware, which
          applications are on and off), and what each of the two OTP slots holds (programmed / empty).
          The same report goes into a log file whose path is printed at the start and the end;
-      2. tells a key that can never type a code (a FIDO-only key: the "Security Key" series, or a
-         YubiKey 5 whose OTP part is switched off) from one that can, and says which in plain words.
+      2. tells a key that can never type a code (a FIDO-only key: the "Security Key" series) from one
+         whose OTP part is switched off, and from one that can, and says which in plain words -- and
+         says so when it CANNOT tell (a key whose OTP is off or absent, read without administrator).
          A YubiKey 5 with OTP switched off is offered a one-step switch-on;
       3. reads what the key types today: a SHORT press (slot 1) and a LONG press (slot 2, ~3 s),
          masked, never echoed and never written to the log;
@@ -27,7 +33,9 @@
     see the key it is working on.
 
     It runs as administrator and reopens itself as administrator if it is not: Windows lets only an
-    administrator talk to the FIDO part of a key, and some keys have nothing else.
+    administrator talk to the FIDO part of a key, and some keys have nothing else. If Windows does not
+    open the administrator window (the question was dismissed, or a mistyped administrator password),
+    it says why and asks again, up to 3 times, before carrying on without administrator.
 
     Enrolling needs one sign-in at the start of the session, the same one the bench asks for: a long
     press of YOUR OWN enrolled key, or the pilot code while pilot mode is open. That is what stops a
@@ -60,7 +68,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 may still offer TLS 1.0 first; the service accepts 1.2 only.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 # Where this exact version is published; used only to reopen it as administrator after `irm | iex`.
 $SelfUrl = "https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v$ScriptVersion/Setup-YubiKeys.ps1"
 
@@ -92,13 +100,29 @@ $YubicoPids = @{
     '0116' = @{ Name = 'YubiKey NEO: OTP + FIDO + smart card'; Otp = $true;  Fido = $true }
     '0120' = @{ Name = 'Security Key by Yubico: FIDO only (has no OTP part at all)'; Otp = $false; Fido = $true }
     '0401' = @{ Name = 'YubiKey 4/5: OTP only';                Otp = $true;  Fido = $false }
-    '0402' = @{ Name = 'YubiKey 4/5 or Security Key: FIDO only (OTP switched off, or not on this model)'; Otp = $false; Fido = $true }
+    '0402' = @{ Name = 'YubiKey 4/5 with OTP switched off, or a Security Key: FIDO only'; Otp = $false; Fido = $true }
     '0403' = @{ Name = 'YubiKey 4/5: OTP + FIDO';              Otp = $true;  Fido = $true }
     '0404' = @{ Name = 'YubiKey 4/5: smart card only';         Otp = $false; Fido = $false }
     '0405' = @{ Name = 'YubiKey 4/5: OTP + smart card';        Otp = $true;  Fido = $false }
     '0406' = @{ Name = 'YubiKey 4/5: FIDO + smart card (OTP switched off)'; Otp = $false; Fido = $true }
     '0407' = @{ Name = 'YubiKey 4/5: OTP + FIDO + smart card'; Otp = $true;  Fido = $true }
     '0410' = @{ Name = 'YubiKey Plus';                         Otp = $true;  Fido = $true }
+}
+# USB products that say the OTP part is OFF on a key that may have one (a YubiKey 5 / NEO with OTP
+# switched off) or may not (a Security Key also shows as 0402). Without administrator ykman cannot
+# open such a key, so which of the two it is CANNOT be told: the script says so instead of guessing.
+# Only 0120 is FIDO-only by its USB product alone (Security Key by Yubico).
+$OtpOffPids = @('0402', '0406', '0113', '0115')
+# What `ykman list` prints in [brackets] (the USB interfaces switched on) -> the USB products it can be.
+# Used to tell which line of `ykman list` is which USB device Windows sees.
+$IfacePids = @{
+    'OTP'           = @('0010', '0110', '0401')
+    'FIDO'          = @('0113', '0120', '0402')
+    'OTP+FIDO'      = @('0114', '0403', '0410')
+    'CCID'          = @('0112', '0404')
+    'OTP+CCID'      = @('0111', '0405')
+    'FIDO+CCID'     = @('0115', '0406')
+    'OTP+FIDO+CCID' = @('0116', '0407')
 }
 
 function Test-Admin {
@@ -233,11 +257,14 @@ function Open-Authenticator {
 # ------------------------------------------------------------------------------- ykman
 
 function Invoke-Ykman {
-    param([string[]]$YkArgs)
+    # Every call names the picked key (--device <serial>, in $script:DeviceArgs) unless -NoDevice:
+    # only `ykman list`, which looks at ALL keys, is run without it.
+    param([string[]]$YkArgs, [switch]$NoDevice)
     # Windows PowerShell 5.1: with ErrorActionPreference=Stop, a native command's stderr line
     # redirected by 2>&1 becomes a terminating error. ykman prints warnings there; read them instead.
     $ErrorActionPreference = 'Continue'
     $all = @($script:DeviceArgs) + $YkArgs
+    if ($NoDevice) { $all = $YkArgs }
     $out = & $script:Ykman @all 2>&1 | ForEach-Object { "$_" } | Out-String
     return @{ Code = $LASTEXITCODE; Text = $out.Trim() }
 }
@@ -261,9 +288,16 @@ function Invoke-YkmanChecked {
 
 function Get-UsbYubiKeys {
     # What WINDOWS sees, whatever ykman can or cannot open: the USB parent device of each Yubico key
-    # (vendor 1050). Works without administrator and without ykman.
-    $devs = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -match '^USB\\VID_1050&PID_([0-9A-F]{4})\\' })
+    # (vendor 1050). Works without administrator and without ykman. Asked of WMI with a filter first
+    # (fast enough to poll once a second); Get-PnpDevice, which lists every device, if that fails.
+    $devs = @()
+    try {
+        $devs = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE 'USB%VID_1050%'" -ErrorAction Stop |
+            ForEach-Object { [pscustomobject]@{ InstanceId = "$($_.PNPDeviceID)"; FriendlyName = $_.Name; Status = $_.Status } })
+    } catch {
+        $devs = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
+    }
+    $devs = @($devs | Where-Object { $_.InstanceId -match '^USB\\VID_1050&PID_([0-9A-F]{4})\\' })
     $out = @()
     foreach ($d in $devs) {
         $null = $d.InstanceId -match 'PID_([0-9A-F]{4})'
@@ -273,55 +307,310 @@ function Get-UsbYubiKeys {
         if ($known) { $meaning = $known.Name }
         $out += [pscustomobject]@{
             Pid = $pid4; Meaning = $meaning; Name = $d.FriendlyName; Status = $d.Status; InstanceId = $d.InstanceId
-            Otp = ($known -and $known.Otp); Fido = ($known -and $known.Fido)
+            Otp = [bool]($known -and $known.Otp); Fido = [bool]($known -and $known.Fido)
         }
     }
     return ,$out
 }
 
+function Get-UsbSignature {
+    # The SET of Yubico USB devices plugged in now, as one string: the picker redraws when it changes.
+    $u = Get-UsbYubiKeys
+    return (($u | ForEach-Object { $_.InstanceId } | Sort-Object) -join '|')
+}
+
+function Get-YkmanKeys {
+    # What ykman can see: one entry per line of `ykman list` (a key ykman cannot open shows as e.g.
+    # "YubiKey [FIDO] <access denied>", with no serial), plus any serial `ykman list --serials` adds.
+    # The raw output is kept for the report.
+    $keys = @()
+    $list = Invoke-Ykman -NoDevice @('list')
+    $script:LastYkmanList = $list.Text
+    foreach ($l in ($list.Text -split "`r?`n")) {
+        if ($l -notmatch '\S' -or $l -match '^\s*(WARNING|ERROR)') { continue }
+        $name = $l.Trim(); $iface = ''; $ser = ''
+        if ($l -match '^(.*?)\s*\[([A-Z+]+)\]') { $name = $Matches[1].Trim(); $iface = $Matches[2] }
+        if ($l -match 'Serial:\s*(\d+)') { $ser = $Matches[1] }
+        # ykman joins the interfaces as OTP+FIDO+CCID; put them in that order whatever it printed
+        $parts = @($iface -split '\+' | Where-Object { $_ })
+        $norm = (@('OTP', 'FIDO', 'CCID') | Where-Object { $parts -contains $_ }) -join '+'
+        $cands = @(); if ($norm -and $IfacePids.ContainsKey($norm)) { $cands = $IfacePids[$norm] }
+        $keys += [pscustomobject]@{ Name = $name; Serial = $ser; Pids = $cands }
+    }
+    $s = Invoke-Ykman -NoDevice @('list', '--serials')
+    foreach ($x in @($s.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })) {
+        if (-not ($keys | Where-Object { $_.Serial -eq $x })) {
+            $keys += [pscustomobject]@{ Name = 'YubiKey'; Serial = $x; Pids = @() }
+        }
+    }
+    return ,$keys
+}
+
+function Get-KeyRows {
+    # Every key plugged in, one row each, numbered: what Windows sees (USB product) joined to what
+    # ykman sees (serial, model). A key ykman cannot open still gets a row, from Windows, with no serial.
+    $usb = Get-UsbYubiKeys
+    $yk  = Get-YkmanKeys
+    $claimed = @{}
+    $rows = New-Object System.Collections.ArrayList
+    # keys with a serial first, so a key ykman cannot open never takes the USB device of one it can
+    $ordered = @($yk | Where-Object { $_.Serial }) + @($yk | Where-Object { -not $_.Serial })
+    foreach ($k in $ordered) {
+        $u = $null
+        foreach ($c in $usb) {
+            if (-not $claimed[$c.InstanceId] -and $k.Pids -contains $c.Pid) { $u = $c; break }
+        }
+        if (-not $u -and -not $k.Serial) { continue }   # no serial and no USB match: the USB pass lists it
+        if ($u) { $claimed[$u.InstanceId] = $true }
+        [void]$rows.Add([pscustomobject]@{ Serial = $k.Serial; Model = $k.Name; Usb = $u })
+    }
+    # A key with a serial whose USB device could not be matched (a product number not in the table):
+    # if exactly as many USB devices are left over, pair them in order rather than list a key twice.
+    $loose = @($rows | Where-Object { -not $_.Usb })
+    $left  = @($usb | Where-Object { -not $claimed[$_.InstanceId] })
+    if ($loose.Count -and $loose.Count -eq $left.Count) {
+        for ($i = 0; $i -lt $loose.Count; $i++) { $loose[$i].Usb = $left[$i]; $claimed[$left[$i].InstanceId] = $true }
+    }
+    foreach ($c in $usb) {
+        if (-not $claimed[$c.InstanceId]) { [void]$rows.Add([pscustomobject]@{ Serial = ''; Model = ''; Usb = $c }) }
+    }
+    $out = @()
+    $n = 0
+    foreach ($r in $rows) {
+        $n++
+        $what = $r.Model
+        $usbPid = ''
+        if ($r.Usb) { $what = $r.Usb.Meaning; $usbPid = $r.Usb.Pid }
+        if (-not $what) { $what = 'YubiKey' }
+        $out += [pscustomobject]@{ Num = $n; Serial = $r.Serial; Model = $r.Model; What = $what; Pid = $usbPid; Usb = $r.Usb }
+    }
+    return ,$out
+}
+
+function Get-RowsSignature {
+    param($Rows)
+    return (($Rows | ForEach-Object { "$($_.Serial)/$($_.Pid)/$($_.Model)" }) -join '|')
+}
+
+function Show-KeyTable {
+    # The numbered list of keys. Live mode clears the screen and redraws it whole; the keys done in
+    # this run stay listed above it.
+    param($Rows, [string]$Note, [switch]$Plain)
+    if (-not $Plain) { Clear-Host }
+    Write-Host ''
+    $who = ''; if ($script:SignedInAs) { $who = " -- signed in as $($script:SignedInAs)" }
+    Write-Host "  ETS bench YubiKey setup v$ScriptVersion$who" -ForegroundColor Cyan
+    if ($script:Done -and $script:Done.Count) {
+        Write-Host "  Done this run ($($script:Done.Count)):"
+        $script:Done | ForEach-Object { Write-Host $_ }
+    }
+    Write-Host ''
+    if ($Plain) { Write-Host '  YubiKeys plugged in now:' }
+    else { Write-Host "  YubiKeys plugged in now (live: updated $(Get-Date -Format 'HH:mm:ss') as keys go in and out):" }
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        Write-Host '  No YubiKey plugged in -- waiting...' -ForegroundColor Yellow
+    } else {
+        Write-Host ('  {0,-4} {1,-18} {2,-12} {3}' -f '#', 'Serial', 'USB product', 'What it is (from the USB product number)')
+        foreach ($r in $Rows) {
+            $ser = $r.Serial; if (-not $ser) { $ser = '(not readable)' }
+            $up = $r.Pid; if (-not $up) { $up = '(not seen)' }
+            Write-Host ('  {0,-4} {1,-18} {2,-12} {3}' -f $r.Num, $ser, $up, $r.What)
+        }
+    }
+    if ($Note) { Write-Host ''; foreach ($l in ($Note -split "`n")) { Write-Host "  $l" -ForegroundColor Yellow } }
+    Write-Host ''
+    if (-not $Plain) {
+        Write-Host '  Type the NUMBER of the key to work on, then Enter.  R + Enter = look again.  Q + Enter = finish.'
+        Write-Host -NoNewline '  Key number: '
+    }
+}
+
+function Resolve-KeyChoice {
+    # The row the typed number names, or why it cannot be picked. Returns @{ Row; Note }.
+    param($Rows, [string]$Text)
+    $n = 0
+    if (-not [int]::TryParse($Text, [ref]$n) -or $n -lt 1 -or $n -gt $Rows.Count) {
+        return @{ Row = $null; Note = "There is no key #$Text in the list. Type a number from the # column." }
+    }
+    $r = $Rows[$n - 1]
+    if (-not $r.Serial) {
+        $blind = @($Rows | Where-Object { -not $_.Serial })
+        if ($blind.Count -gt 1) {
+            return @{ Row = $null; Note = ("Key #$n has no readable serial, and so do $($blind.Count - 1) other key(s): they cannot be told apart.`n" +
+                "Unplug the others: Leave exactly one plugged in without a serial, then pick it.") }
+        }
+    }
+    return @{ Row = $r; Note = '' }
+}
+
+function Clear-KeyBuffer {
+    # Anything still waiting in the keyboard buffer (a key touched mid-list) must not reach the next
+    # prompt -- or, after Q, the PowerShell prompt, where it would run as a command.
+    try { while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) } } catch { }
+}
+
+function Select-KeyPlain {
+    # The picker for a host with no real console (PowerShell ISE, redirected input): the same list,
+    # read with Read-Host, refreshed each time Enter is pressed. Returns the row, or $null to finish.
+    $note = ''
+    while ($true) {
+        $rows = Get-KeyRows
+        Show-KeyTable -Rows $rows -Note $note -Plain
+        $a = (Read-Host '  Number of the key to work on, then Enter (Enter alone = look again, Q = finish)').Trim()
+        $note = ''
+        if ($a -match '^[qQ]$') { return $null }
+        if ($a -eq '' -or $a -match '^[rR]$') { continue }
+        if ($a -notmatch '^\d{1,3}$') { $note = 'That was not a number (if a key was touched, what it typed is not shown).'; continue }
+        $c = Resolve-KeyChoice -Rows $rows -Text $a
+        if ($c.Row) { return $c.Row }
+        $note = $c.Note
+    }
+}
+
+function Select-Key {
+    # THE KEY PICKER. Lists every key plugged in, numbered, and keeps the list current: about once a
+    # second it asks Windows which Yubico devices are present and redraws ONLY when that set changes
+    # (and once more 2 s later, when a key just plugged in has settled and ykman can read it).
+    # The technician types the number and Enter. Returns the row, or $null to finish.
+    # A touched key types too, fast: 3+ characters closer than 40 ms apart are a key, not a person,
+    # and are dropped unseen (a slot may hold a password). Only digits, R and Q are echoed, and with
+    # [Console]::Write, which the transcript does not record.
+    $live = $true
+    try { $null = [Console]::KeyAvailable } catch { $live = $false }
+    if (-not $live) { return Select-KeyPlain }
+
+    $sig = $null; $rows = @(); $typed = ''; $note = ''; $settle = $null; $redraw = $false
+    $burst = $false; $fast = 0; $last = [DateTime]::MinValue
+    while ($true) {
+        $now = Get-UsbSignature
+        if ($null -eq $sig -or $now -ne $sig) {
+            $sig = $now; $rows = Get-KeyRows; $settle = (Get-Date).AddSeconds(2); $redraw = $true
+        } elseif ($settle -and (Get-Date) -ge $settle) {
+            $settle = $null
+            $again = Get-KeyRows
+            if ((Get-RowsSignature $again) -ne (Get-RowsSignature $rows)) { $rows = $again; $redraw = $true }
+        }
+        if ($redraw) {
+            Show-KeyTable -Rows $rows -Note $note
+            if ($typed) { [Console]::Write($typed) }
+            $redraw = $false
+        }
+        $until = (Get-Date).AddMilliseconds(1000)
+        $enter = $false
+        while (-not $enter -and (Get-Date) -lt $until) {
+            if (-not [Console]::KeyAvailable) { Start-Sleep -Milliseconds 50; continue }
+            $k = [Console]::ReadKey($true)
+            $t = Get-Date
+            if (($t - $last).TotalMilliseconds -lt 40) { $fast++ } else { $fast = 0 }
+            $last = $t
+            if ($fast -ge 2 -and -not $burst) {
+                $burst = $true
+                if ($typed) { [Console]::Write(("`b `b" * $typed.Length)) }
+                $typed = ''
+            }
+            if ($k.Key -eq [ConsoleKey]::Enter) { $enter = $true; break }
+            if ($burst) { continue }
+            if ($k.Key -eq [ConsoleKey]::Backspace) {
+                if ($typed) { $typed = $typed.Substring(0, $typed.Length - 1); [Console]::Write("`b `b") }
+                continue
+            }
+            if ($k.Key -eq [ConsoleKey]::Escape) {
+                if ($typed) { [Console]::Write(("`b `b" * $typed.Length)) }
+                $typed = ''; continue
+            }
+            $ch = [string]$k.KeyChar
+            if ($ch -match '^[0-9qQrR]$' -and $typed.Length -lt 3) { $typed += $ch; [Console]::Write($ch) }
+        }
+        if (-not $enter) { continue }
+        $a = $typed; $typed = ''
+        if ($burst) {
+            $burst = $false; $fast = 0
+            $note = 'A key was touched while the list was showing: what it typed was ignored (not shown).'
+            $redraw = $true; continue
+        }
+        Write-Host ''
+        $note = ''
+        if ($a -match '^[qQ]$') { Clear-KeyBuffer; return $null }
+        if ($a -eq '' -or $a -match '^[rR]$') { $sig = $null; continue }
+        if ($a -notmatch '^\d+$') { $note = "Type the number of a key from the # column, then Enter."; $redraw = $true; continue }
+        $c = Resolve-KeyChoice -Rows $rows -Text $a
+        if ($c.Row) { Clear-KeyBuffer; return $c.Row }
+        $note = $c.Note; $redraw = $true
+    }
+}
+
 function Get-KeyFacts {
-    # Everything the script knows about the ONE key plugged in, and the full report of how it knows.
-    # Returns a hashtable: Usb, Serial, DeviceType, Firmware, OtpState (Enabled|Disabled|Not available|
-    # unknown), Slot1, Slot2 (programmed|empty|unknown), Count, Report.
-    $f = @{ Usb = @(); Serial = ''; DeviceType = ''; Firmware = ''; OtpState = 'unknown';
-            Slot1 = 'unknown'; Slot2 = 'unknown'; Count = 0 }
-    $f.Usb = Get-UsbYubiKeys
-    $f.Count = $f.Usb.Count
-    $usbText = ($f.Usb | ForEach-Object { "USB product $($_.Pid) = $($_.Meaning)  [$($_.Name), $($_.Status)]  $($_.InstanceId)" }) -join "`n"
-    Write-Blob 'What Windows sees (USB devices from Yubico, vendor 1050)' $usbText
+    # Everything the script knows about the PICKED key, and the full report of how it knows.
+    # Returns a hashtable: Present, Usb (its USB device or $null), Others (how many other keys are
+    # plugged in), Serial, DeviceType, Firmware, OtpState (Enabled | Disabled | Not available |
+    # unknown | unknown (not administrator)), Slot1, Slot2 (programmed | empty | unknown).
+    param($Pick)
+    $f = @{ Present = $false; Usb = $null; Others = 0; Serial = $Pick.Serial; DeviceType = ''; Firmware = '';
+            OtpState = 'unknown'; Slot1 = 'unknown'; Slot2 = 'unknown' }
+    $rows = Get-KeyRows
+    $me = $null
+    if ($Pick.Serial) {
+        $me = $rows | Where-Object { $_.Serial -eq $Pick.Serial } | Select-Object -First 1
+    } else {
+        $blind = @($rows | Where-Object { -not $_.Serial })
+        if ($blind.Count -eq 1) { $me = $blind[0] }
+    }
+    $usbText = ($rows | ForEach-Object {
+        $mark = '   '; if ($me -and $_.Num -eq $me.Num) { $mark = '>> ' }
+        $ser = $_.Serial; if (-not $ser) { $ser = '(not readable)' }
+        if ($_.Usb) { "$mark" + "serial $ser  USB product $($_.Usb.Pid) = $($_.Usb.Meaning)  [$($_.Usb.Name), $($_.Usb.Status)]  $($_.Usb.InstanceId)" }
+        else { "$mark" + "serial $ser  $($_.Model)  (no USB device matched)" }
+    }) -join "`n"
+    Write-Blob 'What Windows sees (USB devices from Yubico, vendor 1050; >> = the key picked)' $usbText
+    Write-Blob 'ykman list' $script:LastYkmanList
+    if (-not $me) { return $f }
+    $f.Present = $true
+    $f.Usb = $me.Usb
+    $f.Others = $rows.Count - 1
 
     $script:DeviceArgs = @()
-    $list = Invoke-Ykman @('list')
-    Write-Blob 'ykman list' $list.Text
-    $lines = @($list.Text -split "`r?`n" | Where-Object { $_ -match '\S' -and $_ -notmatch '^(WARNING|ERROR)' })
-    if ($lines.Count -gt $f.Count) { $f.Count = $lines.Count }
-    if ($f.Count -ne 1) { return $f }
-
-    $ser = Invoke-Ykman @('list', '--serials')
-    $sers = @($ser.Text -split "`r?`n" | Where-Object { $_ -match '^\d+$' })
-    if ($sers.Count -eq 1) { $f.Serial = $sers[0]; $script:DeviceArgs = @('--device', $f.Serial) }
-
-    $info = Invoke-Ykman @('info')
-    Write-Blob 'ykman info' $info.Text
-    if ($info.Text -match '(?m)^Device type:\s*(.+)$')      { $f.DeviceType = $Matches[1].Trim() }
-    if ($info.Text -match '(?m)^Firmware version:\s*(.+)$') { $f.Firmware = $Matches[1].Trim() }
-    if (-not $f.Serial -and $info.Text -match '(?m)^Serial number:\s*(\d+)') { $f.Serial = $Matches[1] }
-    if ($info.Text -match '(?m)^\s*(?:Yubico )?OTP\s+(Enabled|Disabled|Not available)') {
-        $f.OtpState = $Matches[1]
-    } elseif ($info.Text -match '(?m)^Enabled USB interfaces:\s*(.+)$') {
-        if ($Matches[1] -match 'OTP') { $f.OtpState = 'Enabled' } else { $f.OtpState = 'Disabled' }
-    } elseif ($f.Usb.Count -eq 1) {
-        # ykman could not open it (most often: not administrator, and the key is FIDO-only).
-        if ($f.Usb[0].Otp) { $f.OtpState = 'Enabled' } elseif ($f.Usb[0].Fido) { $f.OtpState = 'Not available' }
+    if ($f.Serial) { $script:DeviceArgs = @('--device', $f.Serial) }
+    if (-not $f.Serial -and $f.Others -gt 0) {
+        # No serial to name it by: a bare ykman call could answer about ANOTHER key plugged in.
+        Write-Blob 'ykman info' 'not run: this key has no readable serial and other keys are plugged in, so ykman cannot be pointed at it'
+    } else {
+        $info = Invoke-Ykman @('info')
+        Write-Blob 'ykman info' $info.Text
+        if ($info.Text -match '(?m)^Device type:\s*(.+)$')      { $f.DeviceType = $Matches[1].Trim() }
+        if ($info.Text -match '(?m)^Firmware version:\s*(.+)$') { $f.Firmware = $Matches[1].Trim() }
+        if (-not $f.Serial -and $info.Text -match '(?m)^Serial number:\s*(\d+)') { $f.Serial = $Matches[1] }
+        if ($info.Text -match '(?m)^\s*(?:Yubico )?OTP\s+(Enabled|Disabled|Not available)') {
+            $f.OtpState = $Matches[1]
+        } elseif ($info.Text -match '(?m)^Enabled USB interfaces:\s*(.+)$') {
+            if ($Matches[1] -match 'OTP') { $f.OtpState = 'Enabled' } else { $f.OtpState = 'Disabled' }
+        }
+    }
+    if ($f.OtpState -eq 'unknown' -and $f.Usb) {
+        # ykman could not open it: go by the USB product number, and only as far as it can tell.
+        if ($f.Usb.Pid -eq '0120') {
+            $f.OtpState = 'Not available'      # Security Key by Yubico: has no OTP part at all
+        } elseif ($f.Usb.Otp) {
+            $f.OtpState = 'Enabled'
+        } elseif ($OtpOffPids -contains $f.Usb.Pid -and -not (Test-Admin)) {
+            # OTP switched off on a YubiKey 5 / NEO, or a Security Key with none: the same product number.
+            $f.OtpState = 'unknown (not administrator)'
+        }
     }
 
-    if ($f.OtpState -eq 'Enabled') {
+    if ($f.OtpState -eq 'Enabled' -and ($f.Serial -or $f.Others -eq 0)) {
         $oi = Invoke-Ykman @('otp', 'info')
         Write-Blob 'ykman otp info (what the two OTP slots hold; never their contents)' $oi.Text
         if ($oi.Text -match '(?m)^Slot 1:\s*(\w+)') { $f.Slot1 = $Matches[1].ToLower() }
         if ($oi.Text -match '(?m)^Slot 2:\s*(\w+)') { $f.Slot2 = $Matches[1].ToLower() }
     }
     return $f
+}
+
+function Write-AdminFix {
+    # How to get an administrator window by hand.
+    Write-Host '  To fix it: close this window. Click Start, type PowerShell, RIGHT-CLICK Windows PowerShell and choose' -ForegroundColor Yellow
+    Write-Host '  "Run as administrator" (choose Yes, or type an administrator name and password), then type the line again:' -ForegroundColor Yellow
+    Write-Host '      irm https://ets.azurewebsites.net/yk|iex' -ForegroundColor Yellow
 }
 
 # ------------------------------------------------------------------------------- presses
@@ -357,7 +646,16 @@ function Format-Press {
 }
 
 function Read-BothPresses {
+    # $Target names the key to press ("key #2, serial 12345678"). A press types from whichever key is
+    # touched, so with other keys plugged in ($Alone false) the technician is told not to touch them.
+    param([string]$Target, [bool]$Alone = $true)
     Write-Host ''
+    if ($Target) {
+        Write-Host "  Press $Target -- that key only." -ForegroundColor Cyan
+        if (-not $Alone) {
+            Write-Host '  Other keys are plugged in: do NOT touch them. A press types from whichever key is touched.' -ForegroundColor Yellow
+        }
+    }
     Write-Host '  What you type is hidden (shown as *). That is on purpose.'
     $s = Read-Press '  SHORT press now (tap, under 1.5 s). If nothing appears in 3 s, press Enter'
     $l = Read-Press '  LONG press now (hold about 3 s).    If nothing appears in 5 s, press Enter'
@@ -505,11 +803,12 @@ function Connect-Service {
 }
 
 function Assert-Session {
-    # Before a NEW key goes in: if the sign-in ends within 3 minutes, renew it now, while the
-    # technician's own key can still be the only one plugged in.
+    # Before the list is shown and again before work starts on the key picked: if the sign-in ends
+    # within 3 minutes, renew it now, before a new key's code is read.
     if (-not $script:Enrol) { return }
     if ($script:Session -and (Get-Date).AddMinutes(3) -lt $script:SessionUntil) { return }
     Write-Host '  Your sign-in is about to end. Sign in again before the next key.' -ForegroundColor Yellow
+    Write-Host '  Long-press YOUR OWN enrolled key, not a key you are setting up.' -ForegroundColor Yellow
     if (-not (Connect-Service)) {
         $script:Enrol = $false
         Write-Host '  Carrying on WITHOUT enrolling: keys are set up, and their long press signs in once enrolled.' -ForegroundColor Yellow
@@ -542,36 +841,65 @@ function Register-Key {
 # ------------------------------------------------------------------------------- one key
 
 function Invoke-OneKey {
-    # Everything for the ONE key plugged in. Returns the line for the end-of-run summary.
-    $f = Get-KeyFacts
-    if ($f.Count -eq 0) {
-        Write-Host '  NO KEY FOUND: Windows sees no device from Yubico. Push the key fully in, try another USB port,' -ForegroundColor Red
-        Write-Host '  then press Enter again. (A key that lights up but is not listed above is not a Yubico key.)' -ForegroundColor Red
-        return $null
-    }
-    if ($f.Count -gt 1) {
-        Write-Host "  Found $($f.Count) keys. Leave exactly one plugged in." -ForegroundColor Yellow
+    # Everything for the key PICKED from the list. Returns the line for the end-of-run summary.
+    param($Pick)
+    $sl = $Pick.Serial; if (-not $sl) { $sl = '(no serial readable)' }
+    $target = "key #$($Pick.Num), serial $sl"
+    if (-not $Pick.Serial) { $target = "key #$($Pick.Num) (its serial cannot be read)" }
+    Write-Host ''
+    Write-Host "  Working on $target ($($Pick.What))." -ForegroundColor Cyan
+    $f = Get-KeyFacts -Pick $Pick
+    if (-not $f.Present) {
+        Write-Host "  $target is no longer plugged in (or ykman cannot see it any more). Plug it back in and pick it again." -ForegroundColor Red
+        if (-not $Pick.Serial) { Write-Host '  It has no readable serial: Leave exactly one plugged in without a serial.' -ForegroundColor Red }
         return $null
     }
     $label = $f.DeviceType
-    if (-not $label -and $f.Usb.Count) { $label = $f.Usb[0].Meaning }
+    if (-not $label -and $f.Usb) { $label = $f.Usb.Meaning }
+    if (-not $label) { $label = $Pick.What }
     $serial = $f.Serial
     $sl = $serial; if (-not $sl) { $sl = '(no serial readable)' }
+    $target = "key #$($Pick.Num), serial $sl"
+    if (-not $serial) { $target = "key #$($Pick.Num) (its serial cannot be read)" }
+    $alone = ($f.Others -eq 0)
+    $up = '(not seen)'; if ($f.Usb) { $up = $f.Usb.Pid }
     Write-Host ''
-    Write-Host "  KEY: $label, serial $sl, firmware $($f.Firmware). OTP part: $($f.OtpState). Slot 1: $($f.Slot1). Slot 2: $($f.Slot2)." -ForegroundColor Cyan
+    Write-Host "  KEY #$($Pick.Num): $label, serial $sl, USB product $up, firmware $($f.Firmware). OTP part: $($f.OtpState). Slot 1: $($f.Slot1). Slot 2: $($f.Slot2)." -ForegroundColor Cyan
 
+    if ($f.OtpState -eq 'unknown (not administrator)') {
+        # USB product 0402/0406/0113/0115: OTP off. A YubiKey 5 with OTP switched off and a Security Key
+        # (which has none) look the same from here; only an administrator window can open the key to tell.
+        Write-Host "  OTP is switched off or absent on this key (USB product $up); which one cannot be told without administrator." -ForegroundColor Yellow
+        Write-Host '  ykman could not open it: Windows lets only an administrator talk to the FIDO part of a key, and this' -ForegroundColor Yellow
+        Write-Host '  window is not administrator. If OTP is switched off, an administrator window offers to switch it on;' -ForegroundColor Yellow
+        Write-Host '  if the key has no OTP part (a Security Key), it is set aside for FIDO2 sign-in. Nothing was changed.' -ForegroundColor Yellow
+        Write-AdminFix
+        return "  serial $sl  OTP switched off or absent (USB $up), NOT READ (not administrator)"
+    }
     if ($f.OtpState -eq 'unknown' -and -not (Test-Admin)) {
         Write-Host '  ykman could not open this key, and this window is not administrator. Windows lets only an' -ForegroundColor Red
-        Write-Host '  administrator read the FIDO part of a key. Close this window and run the line again; choose Yes' -ForegroundColor Red
-        Write-Host '  when Windows asks.' -ForegroundColor Red
+        Write-Host '  administrator read the FIDO part of a key. Nothing was changed.' -ForegroundColor Red
+        Write-AdminFix
         return "  serial $sl  NOT READ (not administrator)"
     }
     if ($f.OtpState -eq 'Not available') {
+        # Only when ykman info itself says the OTP application is "Not available", or USB product 0120.
         Write-Host '  FIDO-ONLY KEY: this model has NO one-time-code (OTP) part at all. It cannot type the start command' -ForegroundColor Yellow
         Write-Host '  or a one-time code, so the short/long press set-up does not apply to it. It is a Yubico' -ForegroundColor Yellow
         Write-Host '  "Security Key" (FIDO2 / passkey only). At the bench, type the start command by hand and sign in' -ForegroundColor Yellow
         Write-Host '  with the key by touch (FIDO2 sign-in). Set it aside for FIDO2 enrolment; nothing was changed.' -ForegroundColor Yellow
         return "  serial $sl  FIDO-ONLY ($label): no OTP part; FIDO2 sign-in only"
+    }
+    if (-not $serial -and -not $alone) {
+        # Every change below would be a bare ykman call, which could reach ANOTHER key plugged in.
+        Write-Host '  This key has no readable serial, so ykman cannot be pointed at it while other keys are plugged in.' -ForegroundColor Yellow
+        Write-Host '  Unplug the other keys: Leave exactly one plugged in, then pick it again. Nothing was changed.' -ForegroundColor Yellow
+        return $null
+    }
+    if ($f.OtpState -eq 'unknown') {
+        Write-Host '  ykman could not open this key even as administrator, so what it holds cannot be read. Unplug it, plug it' -ForegroundColor Red
+        Write-Host '  back in, wait 5 s and pick it again; close Yubico Authenticator if it is open. Nothing was changed.' -ForegroundColor Red
+        return "  serial $sl  NOT READ (ykman could not open it)"
     }
     if ($f.OtpState -eq 'Disabled') {
         Write-Host '  The OTP part of this key is SWITCHED OFF (someone turned it off; the key has one). Without it the key' -ForegroundColor Yellow
@@ -581,15 +909,16 @@ function Invoke-OneKey {
         Invoke-YkmanChecked -YkArgs @('config', 'usb', '--enable', 'OTP', '--force') -What 'switch the OTP part on' | Out-Null
         Write-Host '  Switched on. The key restarts itself; waiting 4 s ...'
         Start-Sleep -Seconds 4
-        $f = Get-KeyFacts
+        $f = Get-KeyFacts -Pick $Pick
         if ($f.OtpState -ne 'Enabled') {
-            Write-Host "  The OTP part still reads $($f.OtpState). Unplug the key, plug it back in, and run it again." -ForegroundColor Red
+            Write-Host "  The OTP part still reads $($f.OtpState). Unplug the key, plug it back in, and pick it again." -ForegroundColor Red
             return "  serial $sl  OTP switch-on did not take"
         }
+        $alone = ($f.Others -eq 0)
     }
 
     $cred = $null
-    $p = Read-BothPresses
+    $p = Read-BothPresses -Target $target -Alone $alone
     $plan = Get-Plan $p.Short $p.Long
     Write-Host "  -> $($plan.Why)."
     switch ($plan.Action) {
@@ -613,7 +942,7 @@ function Invoke-OneKey {
 
     # Prove it the way the bench will use it.
     Write-Host '  Checking both presses again...'
-    $v = Read-BothPresses
+    $v = Read-BothPresses -Target $target -Alone $alone
     if ($v.Short.Kind -ne 'command' -or $v.Long.Kind -ne 'otp') {
         Write-Host "  CHECK FAILED: short press = $(Format-Press $v.Short), long press = $(Format-Press $v.Long). Run this key again; if it fails twice, call the operator with the log." -ForegroundColor Red
         return "  serial $sl  CHECK FAILED"
@@ -652,7 +981,7 @@ function Invoke-OneKey {
         if (Confirm-Reset 'Yubico does not recognise its one-time code (the factory code was replaced at some point)') {
             $cred = Reset-KeyForEts -Serial $serial
             Write-Host "  RESET done (key $($cred.PublicId)). Checking both presses again..."
-            $v = Read-BothPresses
+            $v = Read-BothPresses -Target $target -Alone $alone
             if ($v.Short.Kind -ne 'command' -or $v.Long.Kind -ne 'otp' -or $v.Long.Otp.Substring(0, 12) -ne $cred.PublicId) {
                 Write-Host '  CHECK FAILED after the reset. Run this key again (it will offer RESET again).' -ForegroundColor Red
                 return "  serial $sl  reset, CHECK FAILED, NOT ENROLLED"
@@ -684,13 +1013,30 @@ if (-not (Test-Admin) -and -not $NoElevate) {
     if ($PSCommandPath) { $argLine = "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$PSCommandPath`"" }
     else { $argLine = "-NoProfile -ExecutionPolicy Bypass -NoExit -Command `"irm $SelfUrl | iex`"" }
     if ($Service -ne 'https://func-ets-provision-cc.azurewebsites.net' -and $PSCommandPath) { $argLine += " -Service `"$Service`"" }
-    try {
-        Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList $argLine | Out-Null
-        # return, not exit: run as `irm ... | iex`, exit would close the technician's window.
-        return
-    } catch {
-        Write-Host '  Not allowed. Carrying on WITHOUT administrator: FIDO-only keys cannot be read in this window.' -ForegroundColor Yellow
+    # Up to 3 asks: the first failure on a real laptop was a MISTYPED administrator password at the
+    # Windows prompt (2026-11-19), and the script used to give up at once without saying why.
+    $reopened = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList $argLine | Out-Null
+            $reopened = $true
+            break
+        } catch {
+            Write-Host "  Windows did not open the administrator window (try $attempt of 3): $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host '  Usually one of these: the Yes/No question was answered No, closed, or timed out; or this account is' -ForegroundColor Yellow
+            Write-Host '  not an administrator, and the administrator name and password Windows asked for were mistyped or cancelled.' -ForegroundColor Yellow
+            if ($attempt -lt 3) {
+                $again = Read-Host '  Press Enter to ask Windows again (you may have mistyped the password), or type N to carry on without administrator'
+                if ($again -match '^\s*[nN]') { break }
+            }
+        }
     }
+    # return, not exit: run as `irm ... | iex`, exit would close the technician's window.
+    if ($reopened) { return }
+    Write-Host '  Carrying on WITHOUT administrator. What will NOT work in this window: a key whose OTP part is switched' -ForegroundColor Yellow
+    Write-Host '  off or absent (USB product 0402, 0406, 0113, 0115) cannot be read, so it can be neither switched on nor' -ForegroundColor Yellow
+    Write-Host '  told apart from a FIDO-only key. Keys that can type a code (e.g. USB product 0407) work as usual.' -ForegroundColor Yellow
+    Write-AdminFix
 }
 
 $logDir = Join-Path $env:LOCALAPPDATA 'ETS\YubiKeySetup'
@@ -757,21 +1103,28 @@ try {
         Write-Host '  Run this again, signed in, in the office, to enrol them.' -ForegroundColor Yellow
     }
 
-    $done = New-Object System.Collections.ArrayList
+    $script:Done = New-Object System.Collections.ArrayList
+    $done = $script:Done
     while ($true) {
         Write-Host ''
         Write-Host '--------------------------------------------------------------------------------'
         Assert-Session
-        $go = Read-Host '  Plug in ONE key (only one), then press Enter.  Q + Enter to finish'
-        if ($go -match '^[qQ]') { break }
+        # The live, numbered list of every key plugged in; the technician types the number of one.
+        $pick = Select-Key
+        if (-not $pick) { break }
+        # The list may have been showing for a while: renew the sign-in before this key's code is read.
+        Assert-Session
         try {
-            $line = Invoke-OneKey
+            $line = Invoke-OneKey -Pick $pick
             if ($line) { [void]$done.Add($line) }
         } catch {
             Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host '  Nothing more was done to this key. Fix the cause and run it again; the log has the detail.'
+            Write-Host '  Nothing more was done to this key. Fix the cause and pick it again; the log has the detail.'
             [void]$done.Add("  ERROR: $($_.Exception.Message)")
         }
+        $script:DeviceArgs = @()
+        # Masked: a key touched here types into this box, and the log must never hold what it typed.
+        Read-Masked '  Press Enter to go back to the list of keys' | Out-Null
     }
 
     Write-Host ''
