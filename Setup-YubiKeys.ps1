@@ -16,7 +16,9 @@
       2. tells a key that can never type a code (a FIDO-only key: the "Security Key" series) from one
          whose OTP part is switched off, and from one that can, and says which in plain words -- and
          says so when it CANNOT tell (a key whose OTP is off or absent, read without administrator).
-         A YubiKey 5 with OTP switched off is offered a one-step switch-on;
+         A YubiKey 5 with OTP switched off is offered a one-step switch-on. A FIDO-only key is
+         ENROLLED BY TOUCH (FIDO2, since v1.4.0): Windows shows its own "Security key" window, the
+         technician touches the key, and from then on it signs in at the bench by touch (no PIN);
       3. reads what the key types today: a SHORT press (slot 1) and a LONG press (slot 2, ~3 s),
          masked, never echoed and never written to the log;
       4. decides from that what to do -- a new key, a key already set up, or a key that holds
@@ -43,7 +45,9 @@
     The provisioning service answers only the office network, so enrol in the office.
 
     The FIDO2 / passkey / smart-card parts of a key are NOT touched (nor its Authenticator codes) --
-    only the two OTP slots, and only after the technician agrees.
+    only the two OTP slots, and only after the technician agrees. Enrolling a FIDO-only key by touch
+    stores nothing on the key either: the bench asks for a credential the key does not keep (not a
+    passkey), so no passkey slot is used and no passkey already on the key changes.
     Procedure: the review report, section 13, "Enrol a technician's YubiKey".
 
 .PARAMETER Service
@@ -68,7 +72,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 may still offer TLS 1.0 first; the service accepts 1.2 only.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '1.3.3'
+$ScriptVersion = '1.4.0'
 # Where this exact version is published; used only to reopen it as administrator after `irm | iex`.
 $SelfUrl = "https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v$ScriptVersion/Setup-YubiKeys.ps1"
 
@@ -880,8 +884,108 @@ function Show-KeysNow {
     Write-Blob "Keys plugged in now ($($rows.Count))" ($lines -join "`n")
     if ($cannotType.Count) {
         Write-Host "  Key $($cannotType -join ', ') is SEEN, but it cannot type a code (a FIDO-only key, or its OTP part is" -ForegroundColor Yellow
-        Write-Host '  switched off), so it cannot answer the sign-in question below. Sign in with the pilot code or with a' -ForegroundColor Yellow
-        Write-Host '  key that types a code; you pick this key from the list right after.' -ForegroundColor Yellow
+        Write-Host '  switched off). If it is ALREADY enrolled, it signs you in by touch: type F at the sign-in question' -ForegroundColor Yellow
+        Write-Host '  below. If it is NEW, sign in another way (the pilot code, or a key that types a code); you then pick' -ForegroundColor Yellow
+        Write-Host '  this key from the list right after, and a FIDO-only key is enrolled there by touch.' -ForegroundColor Yellow
+    }
+}
+
+function Import-FidoClient {
+    # The security-key (FIDO2) functions come from the provisioning service: ONE copy, the same one
+    # the bench runs (GET api/fido2/client). Loaded once, and only when a touch step is needed. They
+    # are loaded as a module, so they stay defined after this function returns (the script itself may
+    # be running under `irm | iex`). Returns $true when they are ready.
+    if ($script:FidoClientLoaded) { return $true }
+    try {
+        $text = Invoke-RestMethod -Uri "$Service/api/fido2/client" -Method Get -UseBasicParsing -TimeoutSec 30
+        if ("$text" -notmatch 'function Get-EtsFidoAssertion' -or "$text" -notmatch 'function New-EtsFidoCredential') {
+            throw 'the provisioning service did not answer with the security-key functions'
+        }
+        New-Module -Name EtsWebAuthn -ScriptBlock ([scriptblock]::Create("$text")) |
+            Import-Module -Global -Force -DisableNameChecking
+        if (-not (Test-EtsWebAuthn)) { throw 'this Windows has no security-key support (webauthn.dll); it needs Windows 10 1903 or later' }
+        $script:FidoClientLoaded = $true
+        return $true
+    } catch {
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        $msg = $_.Exception.Message
+        if ($status -eq 403) { $msg = 'the provisioning service refused this network. It answers only the office network.' }
+        elseif ($status -eq 404) { $msg = 'the provisioning service does not offer sign-in by touch yet (ask the operator to deploy it).' }
+        Write-Host "  Sign-in by touch is not available in this window: $msg" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-FidoSignIn {
+    # A sign-in by TOUCH. Returns what Invoke-Service returns: @{ Ok; Status; Body } with
+    # Body.session and Body.name, or @{ Ok = $false; Status; Error }. Status -1 = the touch itself
+    # failed (not touched, cancelled, key not enrolled); 404 = no security key is enrolled at all.
+    # -OnlyCredential: accept that one credential only (proving a key that was just enrolled).
+    # A request (challenge) lives 2 minutes: a slow touch gets a NEW one, up to 3 times.
+    param([string]$OnlyCredential, [string]$What = 'your security key')
+    for ($n = 1; $n -le 3; $n++) {
+        $c = Invoke-Service -Path 'fido2/challenge' -Body @{ purpose = 'signin' }
+        if (-not $c.Ok) { return $c }
+        $o = $c.Body.options
+        $ids = @($o.allowCredentials | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
+        if ($OnlyCredential) { $ids = @($OnlyCredential) }
+        Write-Host "  Windows now opens its own 'Security key' window. TOUCH $What when it asks. There is NO PIN." -ForegroundColor Cyan
+        try {
+            $a = Get-EtsFidoAssertion -RpId "$($o.rpId)" -ChallengeB64Url "$($c.Body.challenge)" `
+                 -AllowCredentialIdsB64Url $ids -Origin "$($o.origin)"
+        } catch {
+            return @{ Ok = $false; Status = -1; Error = (Get-EtsWebAuthnMessage $_) }
+        }
+        $r = Invoke-Service -Path 'signin' -Body @{ fido = @{
+                 credentialId = $a.credentialId; authenticatorData = $a.authenticatorData
+                 clientDataJSON = $a.clientDataJSON; signature = $a.signature; challenge = "$($c.Body.challenge)" } }
+        if ($r.Ok -or $n -eq 3 -or "$($r.Error)" -notmatch '(?i)expired') { return $r }
+        Write-Host '  That took longer than 2 minutes, so the request expired. Asking again: touch the key as soon as' -ForegroundColor Yellow
+        Write-Host '  the Windows window appears.' -ForegroundColor Yellow
+    }
+}
+
+function Register-FidoKey {
+    # Enrol a FIDO-only key to $Holder BY TOUCH. Returns @{ Ok; Message; KeyId; CredentialId; Already }.
+    # The service hands out a request made for THIS signed-in technician; Windows asks the key for a
+    # new credential (one touch); the service checks the answer and writes the row.
+    param([string]$Holder, [string]$Serial)
+    $reSigned = $false
+    for ($n = 1; $n -le 3; $n++) {
+        $c = Invoke-Service -Path 'fido2/challenge' -Body @{ purpose = 'register'; name = $Holder } -Session $script:Session
+        if (-not $c.Ok -and $c.Status -eq 401 -and -not $reSigned) {
+            # Signed out between keys (unlikely: Assert-Session renews first). Nothing was sent yet.
+            $reSigned = $true
+            Write-Host '  Your sign-in ended. Sign in again, then this key carries on.' -ForegroundColor Yellow
+            if (Connect-Service) { $n--; continue }
+        }
+        if (-not $c.Ok) { return @{ Ok = $false; Message = $c.Error } }
+        $o = $c.Body.options
+        $exclude = @($o.excludeCredentials | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
+        Write-Host "  Windows now opens its own 'Security key' window. TOUCH the key when it asks. There is NO PIN:" -ForegroundColor Cyan
+        Write-Host '  if Windows asks for one, press Cancel and tell the operator (the bench never uses a PIN).' -ForegroundColor Cyan
+        try {
+            $k = New-EtsFidoCredential -RpId "$($o.rpId)" -RpName "$($o.rpName)" -UserId "$($o.user.id)" `
+                 -UserName "$($o.user.name)" -ChallengeB64Url "$($c.Body.challenge)" -Origin "$($o.origin)" `
+                 -ExcludeCredentialIdsB64Url $exclude
+        } catch {
+            $m = Get-EtsWebAuthnMessage $_
+            if ($m -match 'already enrolled') { return @{ Ok = $true; Already = $true; Message = $m } }
+            return @{ Ok = $false; Message = $m }
+        }
+        $r = Invoke-Service -Path 'technicians' -Session $script:Session -Body @{ name = $Holder; serial = "$Serial"; fido = @{
+                 attestationObject = $k.attestationObject; clientDataJSON = $k.clientDataJSON; challenge = "$($c.Body.challenge)" } }
+        if ($r.Ok -and $r.Body.enrolled) {
+            return @{ Ok = $true; Already = [bool]$r.Body.already; KeyId = "$($r.Body.key_id)"; CredentialId = "$($k.credentialId)"
+                      Message = "enrolled to $($r.Body.name)" }
+        }
+        if ($n -lt 3 -and "$($r.Error)" -match '(?i)expired') {
+            Write-Host '  That took longer than 2 minutes, so the request expired. Asking again: touch the key as soon as' -ForegroundColor Yellow
+            Write-Host '  the Windows window appears.' -ForegroundColor Yellow
+            continue
+        }
+        return @{ Ok = $false; Message = $r.Error }
     }
 }
 
@@ -891,13 +995,29 @@ function Connect-Service {
     Write-Host ''
     Write-Host '  SIGN IN first: it is what lets this script ENROL the keys you set up. One of:' -ForegroundColor Cyan
     Write-Host '    - HOLD (about 3 s) a key that is ALREADY enrolled to you, then unplug it;' -ForegroundColor Cyan
+    Write-Host '    - or type F and press Enter to sign in by TOUCHING a security key that is ALREADY enrolled' -ForegroundColor Cyan
+    Write-Host '      to you (a FIDO-only key: it cannot type a code);' -ForegroundColor Cyan
     Write-Host '    - or type the pilot code;' -ForegroundColor Cyan
     Write-Host '    - or press Enter alone to set keys up WITHOUT enrolling them.' -ForegroundColor Cyan
     Write-Host '  The key(s) to set up are picked from a numbered list right after this.' -ForegroundColor Cyan
     for ($try = 1; $try -le 3; $try++) {
-        $code = Read-Masked '  Your key or the pilot code'
+        $code = Read-Masked '  Your key, the pilot code, or F'
         if (-not $code) { return $false }
-        $r = Invoke-Service -Path 'signin' -Body @{ otp = $code }
+        if ($code -match '^[fF]$') {
+            # Sign in by touch. Not being able to (no key enrolled yet, or the functions did not load)
+            # is not a wrong code: say so plainly and ask again without using up a try.
+            if (-not (Import-FidoClient)) { $try--; Write-Host '  Sign in another way: a key that types a code, or the pilot code.' -ForegroundColor Yellow; continue }
+            $r = Invoke-FidoSignIn
+            if (-not $r.Ok -and $r.Status -eq 404) {
+                Write-Host '  No security key is enrolled yet, so nobody can sign in by touch. Sign in another way (a key that' -ForegroundColor Yellow
+                Write-Host '  types a code, or the pilot code); a new security key is then enrolled from the list of keys.' -ForegroundColor Yellow
+                $try--
+                continue
+            }
+        } else {
+            $r = Invoke-Service -Path 'signin' -Body @{ otp = $code }
+        }
+        $code = $null
         if ($r.Ok -and $r.Body.session) {
             $script:Session = $r.Body.session
             $script:SessionUntil = (Get-Date).AddSeconds([int]$r.Body.expires_in)
@@ -924,7 +1044,7 @@ function Assert-Session {
     if (-not $script:Enrol) { return }
     if ($script:Session -and (Get-Date).AddMinutes(3) -lt $script:SessionUntil) { return }
     Write-Host '  Your sign-in is about to end. Sign in again before the next key.' -ForegroundColor Yellow
-    Write-Host '  Long-press YOUR OWN enrolled key, not a key you are setting up.' -ForegroundColor Yellow
+    Write-Host '  Long-press YOUR OWN enrolled key (or type F to touch your own security key), not a key you are setting up.' -ForegroundColor Yellow
     if (-not (Connect-Service)) {
         $script:Enrol = $false
         Write-Host '  Carrying on WITHOUT enrolling: keys are set up, and their long press signs in once enrolled.' -ForegroundColor Yellow
@@ -955,6 +1075,64 @@ function Register-Key {
 }
 
 # ------------------------------------------------------------------------------- one key
+
+function Invoke-FidoOnlyKey {
+    # A FIDO-only key (no OTP part): enrol it BY TOUCH, then prove it with a real sign-in by touch, the
+    # way the bench will ask for it. Returns the line for the end-of-run summary. Nothing is written
+    # to the key's OTP slots (it has none), and no passkey is stored on it.
+    param([string]$Label, [string]$Serial, [string]$SerialText)
+    if (-not $script:Enrol) {
+        Write-Host '  Enrolling it needs a signed-in run: run this again and SIGN IN first (a key that types a code, the' -ForegroundColor Yellow
+        Write-Host '  pilot code, or F with a security key that is already enrolled). Nothing was changed.' -ForegroundColor Yellow
+        return "  serial $SerialText  FIDO-ONLY ($Label): NOT ENROLLED (not signed in)"
+    }
+    $holder = (Read-Host '  Who will carry this key? Full name (blank = leave it, nothing enrolled)').Trim()
+    if (-not $holder) {
+        Write-Host '  Left as it is: nothing was enrolled. Pick the key again when you know who carries it.' -ForegroundColor Yellow
+        return "  serial $SerialText  FIDO-ONLY ($Label): left, not enrolled (no name)"
+    }
+    if (-not (Import-FidoClient)) {
+        Write-Host '  Nothing was enrolled. Run the line again on the office network; if it says the same, send the operator the log.' -ForegroundColor Red
+        return "  serial $SerialText  FIDO-ONLY ($Label)  $holder  NOT ENROLLED (sign-in by touch not available)"
+    }
+    Write-Host "  Enrolling this key to $holder. Leave ONLY this security key plugged in, so the touch goes to it." -ForegroundColor Cyan
+    $e = Register-FidoKey -Holder $holder -Serial $Serial
+    if (-not $e.Ok) {
+        Write-Host "  NOT ENROLLED: $($e.Message)" -ForegroundColor Red
+        Write-Host '  Nothing was changed. Pick the key again to retry (touch it as soon as the Windows window appears);' -ForegroundColor Red
+        Write-Host '  if it fails twice, send the operator the log.' -ForegroundColor Red
+        return "  serial $SerialText  FIDO-ONLY ($Label)  $holder  NOT ENROLLED: $($e.Message)"
+    }
+    if ($e.Already -and -not $e.CredentialId) {
+        # Windows itself refused: this key already holds an ETS credential (it is in the enrolled list).
+        Write-Host '  This security key is ALREADY enrolled, so nothing was changed. It signs in by touch at the bench.' -ForegroundColor Green
+        Write-Host '  To give it to someone else, ask the operator: only the operator can change who a key belongs to.'
+        return "  serial $SerialText  FIDO-ONLY ($Label): already enrolled, left as it is"
+    }
+    # Prove it the way the bench will use it: a real sign-in by touch, with THIS key only. The session
+    # that sign-in returns is thrown away; the technician's own sign-in ($script:Session) is not replaced.
+    Write-Host "  Enrolled (key $($e.KeyId)). Now the proof: one more touch, a real sign-in with this key." -ForegroundColor Cyan
+    $proof = Invoke-FidoSignIn -OnlyCredential $e.CredentialId -What 'the SAME key'
+    if (-not $proof.Ok -and "$($proof.Error)" -match '(?i)not (registered|enrolled)') {
+        # The service may take up to a minute to see a row it has just written.
+        Write-Host '  The service does not list the new key yet (that can take up to a minute). Waiting 60 s, then one more touch.' -ForegroundColor Yellow
+        Start-Sleep -Seconds 60
+        $proof = Invoke-FidoSignIn -OnlyCredential $e.CredentialId -What 'the SAME key'
+    }
+    $proofName = ''; if ($proof.Ok) { $proofName = "$($proof.Body.name)" }
+    $proof.Body = $null
+    if (-not $proof.Ok) {
+        Write-Host "  ENROLLED: key $($e.KeyId), $($e.Message) -- but the test sign-in did NOT pass: $($proof.Error)" -ForegroundColor Red
+        Write-Host '  Do not hand the key out yet. Finish (Q), run the line again and sign in with F and this key: if that' -ForegroundColor Red
+        Write-Host '  signs you in, the key is good; if not, send the operator the log.' -ForegroundColor Red
+        return "  serial $SerialText  $($e.KeyId)  $holder  ENROLLED, test sign-in FAILED: $($proof.Error)"
+    }
+    Write-Host "  ENROLLED: key $($e.KeyId), $($e.Message). The test sign-in by touch passed (signed in as $proofName)." -ForegroundColor Green
+    Write-Host '  At the bench this key cannot type the start command: type  curl https://ets.azurewebsites.net|cmd  by hand,' -ForegroundColor Green
+    Write-Host '  then press Enter on the empty YubiKey box and TOUCH the key when Windows asks. No PIN.' -ForegroundColor Green
+    Write-Host '  Label the key with that name.'
+    return "  serial $SerialText  $($e.KeyId)  $holder  ENROLLED (signs in by touch)"
+}
 
 function Invoke-OneKey {
     # Everything for the key PICKED from the list. Returns the line for the end-of-run summary.
@@ -988,7 +1166,7 @@ function Invoke-OneKey {
         Write-Host "  OTP is switched off or absent on this key (USB product $up); which one cannot be told without administrator." -ForegroundColor Yellow
         Write-Host '  ykman could not open it: Windows lets only an administrator talk to the FIDO part of a key, and this' -ForegroundColor Yellow
         Write-Host '  window is not administrator. If OTP is switched off, an administrator window offers to switch it on;' -ForegroundColor Yellow
-        Write-Host '  if the key has no OTP part (a Security Key), it is set aside for FIDO2 sign-in. Nothing was changed.' -ForegroundColor Yellow
+        Write-Host '  if the key has no OTP part (a Security Key), it is enrolled there by touch. Nothing was changed.' -ForegroundColor Yellow
         Write-AdminFix
         return "  serial $sl  OTP switched off or absent (USB $up), NOT READ (not administrator)"
     }
@@ -1000,11 +1178,11 @@ function Invoke-OneKey {
     }
     if ($f.OtpState -eq 'Not available') {
         # Only when ykman info itself says the OTP application is "Not available", or USB product 0120.
-        Write-Host '  FIDO-ONLY KEY: this model has NO one-time-code (OTP) part at all. It cannot type the start command' -ForegroundColor Yellow
-        Write-Host '  or a one-time code, so the short/long press set-up does not apply to it. It is a Yubico' -ForegroundColor Yellow
-        Write-Host '  "Security Key" (FIDO2 / passkey only). The bench cannot sign in with it YET: sign-in by touch' -ForegroundColor Yellow
-        Write-Host '  (FIDO2) is being built. Until then use a key that types a code. Nothing was changed.' -ForegroundColor Yellow
-        return "  serial $sl  FIDO-ONLY ($label): no OTP part; FIDO2 sign-in only"
+        Write-Host '  FIDO-ONLY KEY: this model has NO one-time-code (OTP) part at all (a Yubico "Security Key"). It cannot' -ForegroundColor Yellow
+        Write-Host '  type the start command or a one-time code, so there is nothing to set up on it. It signs in by' -ForegroundColor Yellow
+        Write-Host '  TOUCH instead (FIDO2): at the bench the technician types the start command by hand, presses Enter' -ForegroundColor Yellow
+        Write-Host '  on the empty YubiKey box, and touches the key. Enrolling it here takes two touches and no PIN.' -ForegroundColor Yellow
+        return (Invoke-FidoOnlyKey -Label $label -Serial $serial -SerialText $sl)
     }
     if (-not $serial -and -not $alone) {
         # Every change below would be a bare ykman call, which could reach ANOTHER key plugged in.
