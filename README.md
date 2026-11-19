@@ -8,7 +8,7 @@ provisioning laptop to prepare the YubiKeys used at the device-provisioning benc
 Open **Windows Terminal** (Windows PowerShell 5.1 or PowerShell 7) and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.3.1/Setup-YubiKeys.ps1 | iex
+irm https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v1.3.2/Setup-YubiKeys.ps1 | iex
 ```
 
 The address names a release tag, so the line always runs the same reviewed copy. Each new version gets a
@@ -52,6 +52,7 @@ what a short press of a set-up key types anyway.
 | v1.2.0 | `Setup-YubiKeys.ps1` | `74b2eb432b6f529fac6a8e681e15d57b6a6f24c52953824295911b3b16917509` |
 | v1.3.0 | `Setup-YubiKeys.ps1` | `4ecf56a2ecf8af0aac8c2632a6c072949657719f79a7156a9b64a1b8c64a40f7` |
 | v1.3.1 | `Setup-YubiKeys.ps1` | `7cfcac70afc45f47a1a4309c0288d119eac12cc853880746891bb43e70caa68b` |
+| v1.3.2 | `Setup-YubiKeys.ps1` | `a08e10d8afcb1dce8adea23cf13eabef277b18b10d9d20631ed9e9f6e6906b04` |
 | v1.1.0 | `Setup-YubiKeys.ps1` | `6bb23493630946db4029c4fae3a7067a5392aeb6671732bda577bf98b01d3667` |
 | v1.0.0 | `Setup-YubiKeys.ps1` | `a88414f695a5f620bf4bb787e4ed2de8d4cdad37e656f957a297a538f0f35b37` |
 

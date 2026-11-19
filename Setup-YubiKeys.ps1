@@ -26,9 +26,9 @@
       5. checks both presses again, and ENROLS the key to the person who will carry it, there and
          then: from that moment its long press signs in at the bench.
 
-    It installs what it needs itself, the first time, from Yubico and only if Windows confirms the
-    installer is signed by Yubico AB: the YubiKey Manager command line (ykman), and the Yubico
-    Authenticator app (the window that SHOWS the key; Yubico retired the old "YubiKey Manager" window
+    It installs what it needs itself, from Yubico and only if Windows confirms the installer is signed
+    by Yubico AB, and upgrades either when Yubico publishes a newer one: the YubiKey Manager command
+    line (ykman; held to version 5.x, never a 6.x until tested), and the Yubico Authenticator app (the window that SHOWS the key; Yubico retired the old "YubiKey Manager" window
     on 2026-02-19 and points to Authenticator instead). It opens Authenticator so the technician can
     see the key it is working on.
 
@@ -68,7 +68,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 may still offer TLS 1.0 first; the service accepts 1.2 only.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '1.3.1'
+$ScriptVersion = '1.3.2'
 # Where this exact version is published; used only to reopen it as administrator after `irm | iex`.
 $SelfUrl = "https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v$ScriptVersion/Setup-YubiKeys.ps1"
 
@@ -82,9 +82,16 @@ $Modhex     = 'cbdefghijklnrtuv'
 
 # The oldest ykman this script is written against. A missing or older one is replaced by the newest.
 $YkmanFloor   = [version]'5.0.0'
+# ykman is HELD to this major version: the newest 5.x is installed and upgraded to, never a 6.x.
+# ykman 6 is a rewrite (Rust, in beta at 2026-11-19) and this script reads what ykman PRINTS; a new
+# major is allowed only after it has been tested here (operator, 2026-11-19). A 6.x copy already on
+# the laptop is ignored, not used.
+$YkmanMajor   = 5
 # Yubico's own release folders; the signed Windows installers are published there.
 $YkmanReleases = 'https://developers.yubico.com/yubikey-manager/Releases/'
 $AuthenticatorReleases = 'https://developers.yubico.com/yubioath-flutter/Releases/'
+# Each release page is read ONCE per run (Get-ReleasePage); the install, upgrade and report use that copy.
+$script:ReleasePages = @{}
 
 # What a Yubico USB product number (vendor 1050) means. The product number changes with which parts
 # of the key are switched ON, so it tells a FIDO-only key from one that can type a code, even when
@@ -139,14 +146,48 @@ function Write-Blob {
 
 # ------------------------------------------------------------------------------- installs
 
+function Get-ReleasePage {
+    # The HTML of one of Yubico's release folders, fetched ONCE per run: every later ask (the install,
+    # the upgrade, the Tools report) gets the same copy. $null, and why printed, if it cannot be read.
+    param([string]$Releases)
+    if ($script:ReleasePages.ContainsKey($Releases)) { return $script:ReleasePages[$Releases] }
+    $ProgressPreference = 'SilentlyContinue'
+    $html = $null
+    try {
+        $html = (Invoke-WebRequest -Uri $Releases -UseBasicParsing).Content
+    } catch {
+        Write-Host "  Could not read Yubico's release page $Releases ($($_.Exception.Message))." -ForegroundColor Yellow
+    }
+    $script:ReleasePages[$Releases] = $html
+    return $html
+}
+
+function Select-YubicoRelease {
+    # The newest PLAIN x.y.z among the "$Prefix-<x.y.z>-win64.msi" installers named in a release
+    # page's HTML, compared as a [version] (5.10.0 > 5.9.2). With -Major, only that major (ykman is
+    # held to 5.x). A beta or release candidate (6.0.0-beta.1, 5.11.0rc1) never matches -- the three
+    # numbers must be followed directly by -win64 -- and nor does the .msi.sig beside each installer.
+    # $null if there is none.
+    param([string]$Html, [string]$Prefix, [int]$Major = 0)
+    if (-not $Html) { return $null }
+    $all = @([regex]::Matches($Html, [regex]::Escape($Prefix) + '-(\d+\.\d+\.\d+)-win64\.msi(?!\.sig)') |
+        ForEach-Object { [version]$_.Groups[1].Value })
+    if ($Major) { $all = @($all | Where-Object { $_.Major -eq $Major }) }
+    return ($all | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Get-NewestYubicoRelease {
+    param([string]$Releases, [string]$Prefix, [int]$Major = 0)
+    return (Select-YubicoRelease -Html (Get-ReleasePage $Releases) -Prefix $Prefix -Major $Major)
+}
+
 function Install-YubicoMsi {
-    # The newest x64 installer Yubico publishes in $Releases matching "$Prefix-<version>-win64.msi",
-    # from Yubico itself; run only if Windows says it is signed by Yubico AB. $true on success.
-    param([string]$Releases, [string]$Prefix, [string]$What)
+    # Installs (or upgrades to) $Version of "$Prefix-<version>-win64.msi" from $Releases -- the version
+    # the caller already picked from the release page, so the page is not fetched again -- from Yubico
+    # itself; run only if Windows says it is signed by Yubico AB. $true on success.
+    param([string]$Releases, [string]$Prefix, [string]$What, [version]$Version)
     $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell 5.1 downloads ~10x slower with the bar
-    $page = Invoke-WebRequest -Uri $Releases -UseBasicParsing
-    $newest = [regex]::Matches($page.Content, [regex]::Escape($Prefix) + '-(\d+\.\d+\.\d+)-win64\.msi(?!\.sig)') |
-        ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1
+    $newest = $Version
     if (-not $newest) {
         Write-Host "  Could not find the $What installer on $Releases" -ForegroundColor Red
         return $false
@@ -177,7 +218,7 @@ function Install-YubicoMsi {
             try {
                 $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Verb RunAs -Wait -PassThru
             } catch {
-                Write-Host "  The install was not allowed, so $What is still missing. Run the line again and choose Yes." -ForegroundColor Red
+                Write-Host "  The install was not allowed, so $What $newest was not installed. Run the line again and choose Yes." -ForegroundColor Red
                 return $false
             }
         }
@@ -195,11 +236,13 @@ function Install-YubicoMsi {
 }
 
 function Install-Ykman {
-    Install-YubicoMsi -Releases $YkmanReleases -Prefix 'yubikey-manager' -What 'ykman (YubiKey Manager command line)'
+    param([version]$Version)
+    Install-YubicoMsi -Releases $YkmanReleases -Prefix 'yubikey-manager' -What 'ykman (YubiKey Manager command line)' -Version $Version
 }
 
 function Install-Authenticator {
-    Install-YubicoMsi -Releases $AuthenticatorReleases -Prefix 'yubico-authenticator' -What 'Yubico Authenticator'
+    param([version]$Version)
+    Install-YubicoMsi -Releases $AuthenticatorReleases -Prefix 'yubico-authenticator' -What 'Yubico Authenticator' -Version $Version
 }
 
 function Get-YkmanVersion {
@@ -212,7 +255,8 @@ function Get-YkmanVersion {
 
 function Find-Ykman {
     # Every ykman.exe on the laptop, and the newest of them: one on PATH (pip, an old install) can be
-    # older than the one the installer has just put in Program Files.
+    # older than the one the installer has just put in Program Files. A copy of a NEWER major than
+    # $YkmanMajor (a ykman 6 beta someone installed) is ignored: this script is not tested against it.
     $paths = @()
     $c = Get-Command ykman.exe -ErrorAction SilentlyContinue
     if ($c) { $paths += $c.Source }
@@ -224,16 +268,56 @@ function Find-Ykman {
     $best = $null
     foreach ($p in ($paths | Select-Object -Unique)) {
         $v = Get-YkmanVersion $p
-        if ($v -and (-not $best -or $v -gt $best.Version)) { $best = @{ Path = $p; Version = $v } }
+        if (-not $v) { continue }
+        if ($v.Major -gt $YkmanMajor) {
+            Write-Host "  Not using ykman $v at ${p}: this script is held to ykman $YkmanMajor.x until a newer major is tested here." -ForegroundColor Yellow
+            continue
+        }
+        if (-not $best -or $v -gt $best.Version) { $best = @{ Path = $p; Version = $v } }
     }
     return $best
 }
 
+function Get-AuthenticatorVersion {
+    # The installed Yubico Authenticator version. FIRST from its uninstall entry (DisplayVersion):
+    # Yubico's own installer writes it, it is the version the release file is named by, and it is the
+    # number Windows Installer itself compares when upgrading -- so it is what an upgrade changes, and
+    # it is read without starting the app. The exe's own version stamp (ProductVersion, FileVersion)
+    # comes from the app's build settings and is only the fallback. $null if neither can be read.
+    param([string]$Path)
+    $best = $null
+    foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                     'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+        $entries = @()
+        try { $entries = @(Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object { "$($_.DisplayName)" -like 'Yubico Authenticator*' }) } catch { }
+        foreach ($e in $entries) {
+            if ("$($e.DisplayVersion)" -match '(\d+\.\d+\.\d+)') {
+                $v = [version]$Matches[1]
+                if (-not $best -or $v -gt $best) { $best = $v }
+            }
+        }
+    }
+    if ($best) { return $best }
+    if ($Path) {
+        $vi = $null
+        try { $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo } catch { }
+        if ($vi) {
+            foreach ($s in @($vi.ProductVersion, $vi.FileVersion)) {
+                if ("$s" -match '(\d+\.\d+\.\d+)') { return [version]$Matches[1] }
+            }
+        }
+    }
+    return $null
+}
+
 function Find-Authenticator {
+    # @{ Path; Version } of the installed Yubico Authenticator ($null Version if it cannot be read),
+    # or $null when it is not installed.
     foreach ($root in @("$env:ProgramFiles\Yubico", "${env:ProgramFiles(x86)}\Yubico")) {
         if ($root -and (Test-Path $root)) {
             $hit = Get-ChildItem -Path $root -Filter authenticator.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($hit) { return $hit.FullName }
+            if ($hit) { return @{ Path = $hit.FullName; Version = (Get-AuthenticatorVersion $hit.FullName) } }
         }
     }
     return $null
@@ -1055,38 +1139,109 @@ try {
         "log file:   $logPath"
     ) -join "`n")
 
+    # What Yubico publishes today: each release page is read once, here, and reused below.
+    $ykNewest   = Get-NewestYubicoRelease -Releases $YkmanReleases -Prefix 'yubikey-manager' -Major $YkmanMajor
+    $authNewest = Get-NewestYubicoRelease -Releases $AuthenticatorReleases -Prefix 'yubico-authenticator'
+
+    # ykman. Missing (or older than $YkmanFloor): install the newest 5.x, and STOP if that fails --
+    # no key is touched without a working ykman. Older than the newest 5.x: upgrade, and if the
+    # upgrade fails, say why and carry on with the one already here (it works).
     $yk = Find-Ykman
+    $ykWas = '(none)'; if ($yk) { $ykWas = "$($yk.Version)" }
+    $ykAction = 'kept: the newest published could not be read'
     if (-not $yk -or $yk.Version -lt $YkmanFloor) {
-        if ($yk) { Write-Host "  ykman $($yk.Version) is older than $YkmanFloor; installing the newest from Yubico." }
+        if ($yk) { Write-Host "  ykman $($yk.Version) is older than $YkmanFloor; installing the newest $YkmanMajor.x from Yubico." }
         else     { Write-Host '  The YubiKey Manager command line (ykman) is not on this laptop yet; installing it from Yubico (once per laptop).' }
         $installed = $false
-        try { $installed = Install-Ykman }
+        try { $installed = Install-Ykman -Version $ykNewest }
         catch { Write-Host "  Could not install ykman: $($_.Exception.Message)" -ForegroundColor Red }
         if ($installed) { $yk = Find-Ykman }
         if (-not $yk -or $yk.Version -lt $YkmanFloor) {
             Write-Host '  ykman is not ready, so no key was touched. Run the line again; if it fails twice, call the operator.' -ForegroundColor Red
             return
         }
+        $ykAction = 'installed this run'
+    } elseif ($ykNewest -and $yk.Version -lt $ykNewest) {
+        Write-Host "  ykman $($yk.Version) is on this laptop; Yubico publishes $ykNewest. Upgrading."
+        $upgraded = $false
+        try { $upgraded = Install-Ykman -Version $ykNewest }
+        catch { Write-Host "  Could not upgrade ykman: $($_.Exception.Message)" -ForegroundColor Yellow }
+        $after = $null
+        if ($upgraded) { $after = Find-Ykman }
+        if ($after -and $after.Version -ge $ykNewest) {
+            $yk = $after
+            $ykAction = 'UPGRADED this run'
+        } else {
+            # A failed upgrade does not stop the run: the ykman already here is a usable 5.x.
+            if ($after) { $yk = $after }
+            Write-Host "  The upgrade to ykman $ykNewest did not take (see above). Carrying on with ykman $($yk.Version), which works." -ForegroundColor Yellow
+            $ykAction = "upgrade to $ykNewest FAILED: carried on with the one installed"
+        }
+    } elseif ($ykNewest) {
+        $ykAction = 'up to date'
     }
     $script:Ykman = $yk.Path
     $script:DeviceArgs = @()
 
-    $script:AuthenticatorPath = Find-Authenticator
-    if (-not $script:AuthenticatorPath) {
+    # Yubico Authenticator: a help to SEE the key, never needed to set it up, so nothing about it
+    # stops the run. Missing: install the newest. Older than the newest: upgrade -- but not while it is
+    # open (Windows would hold its files), and a failed upgrade carries on with the one installed.
+    $auth = Find-Authenticator
+    $authWas = '(none)'
+    if ($auth) { $authWas = "$($auth.Version)"; if (-not $auth.Version) { $authWas = '(version not readable)' } }
+    $authAction = 'kept: the newest published could not be read'
+    if (-not $auth) {
         Write-Host '  Yubico Authenticator (the window that shows the key) is not on this laptop yet; installing it from Yubico.'
         $ok = $false
-        try { $ok = Install-Authenticator } catch { Write-Host "  Could not install Yubico Authenticator: $($_.Exception.Message)" -ForegroundColor Yellow }
-        if ($ok) { $script:AuthenticatorPath = Find-Authenticator }
-        if (-not $script:AuthenticatorPath) {
+        try { $ok = Install-Authenticator -Version $authNewest } catch { Write-Host "  Could not install Yubico Authenticator: $($_.Exception.Message)" -ForegroundColor Yellow }
+        if ($ok) { $auth = Find-Authenticator }
+        if ($auth) {
+            $authAction = 'installed this run'
+        } else {
             Write-Host '  Carrying on without it: the window is a help to see the key, not needed to set it up.' -ForegroundColor Yellow
+            $authAction = 'NOT installed: carried on without it'
         }
+    } elseif (-not $auth.Version) {
+        $authAction = 'kept: its installed version could not be read, so it was not upgraded'
+    } elseif ($authNewest -and $auth.Version -lt $authNewest) {
+        if (Get-Process -Name authenticator -ErrorAction SilentlyContinue) {
+            Write-Host "  Yubico Authenticator $($auth.Version) is open, so it is not upgraded to $authNewest now. Close it and run the line again to upgrade; carrying on with $($auth.Version)." -ForegroundColor Yellow
+            $authAction = "upgrade to $authNewest SKIPPED (it was open): carried on with the one installed"
+        } else {
+            Write-Host "  Yubico Authenticator $($auth.Version) is on this laptop; Yubico publishes $authNewest. Upgrading."
+            $upgraded = $false
+            try { $upgraded = Install-Authenticator -Version $authNewest }
+            catch { Write-Host "  Could not upgrade Yubico Authenticator: $($_.Exception.Message)" -ForegroundColor Yellow }
+            $after = $null
+            if ($upgraded) { $after = Find-Authenticator }
+            if ($after -and $after.Version -and $after.Version -ge $authNewest) {
+                $auth = $after
+                $authAction = 'UPGRADED this run'
+            } else {
+                if ($after) { $auth = $after }
+                Write-Host "  The upgrade to Yubico Authenticator $authNewest did not take (see above). Carrying on with the one installed." -ForegroundColor Yellow
+                $authAction = "upgrade to $authNewest FAILED: carried on with the one installed"
+            }
+        }
+    } elseif ($authNewest) {
+        $authAction = 'up to date'
     }
+    $script:AuthenticatorPath = $null
+    if ($auth) { $script:AuthenticatorPath = $auth.Path }
 
     $lang = (Get-WinUserLanguageList)[0]
-    $authText = $script:AuthenticatorPath; if (-not $authText) { $authText = '(not installed)' }
+    $ykNewText = "$ykNewest"; if (-not $ykNewest) { $ykNewText = '(release page not read)' }
+    $authNewText = "$authNewest"; if (-not $authNewest) { $authNewText = '(release page not read)' }
+    $authText = '(not installed)'
+    if ($auth) {
+        $authVer = "$($auth.Version)"; if (-not $auth.Version) { $authVer = '(version not readable)' }
+        $authText = "$authVer at $($auth.Path)"
+    }
     Write-Blob 'Tools' (@(
         "ykman:         $($yk.Version) at $script:Ykman",
+        "               newest $YkmanMajor.x published: $ykNewText (held to $YkmanMajor.x); before this run: $ykWas; $ykAction",
         "Authenticator: $authText",
+        "               newest published: $authNewText; before this run: $authWas; $authAction",
         "keyboard:      $($lang.LanguageTag) $($lang.InputMethodTips -join ',')",
         "start command a short press will type: $Command"
     ) -join "`n")
