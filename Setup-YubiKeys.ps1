@@ -68,7 +68,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 may still offer TLS 1.0 first; the service accepts 1.2 only.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ScriptVersion = '1.3.2'
+$ScriptVersion = '1.3.3'
 # Where this exact version is published; used only to reopen it as administrator after `irm | iex`.
 $SelfUrl = "https://raw.githubusercontent.com/ETS-MSE/yubikey-bench-setup/v$ScriptVersion/Setup-YubiKeys.ps1"
 
@@ -482,7 +482,7 @@ function Show-KeyTable {
     param($Rows, [string]$Note, [switch]$Plain)
     if (-not $Plain) { Clear-Host }
     Write-Host ''
-    $who = ''; if ($script:SignedInAs) { $who = " -- signed in as $($script:SignedInAs)" }
+    $who = ''; if ($script:SignedInHow) { $who = " -- $($script:SignedInHow)" }
     Write-Host "  ETS bench YubiKey setup v$ScriptVersion$who" -ForegroundColor Cyan
     if ($script:Done -and $script:Done.Count) {
         Write-Host "  Done this run ($($script:Done.Count)):"
@@ -863,12 +863,37 @@ function Read-Masked {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
+function Show-KeysNow {
+    # Before the sign-in question: say which keys are plugged in RIGHT NOW, so nobody has to wonder
+    # whether the script sees the key (v1.3.3: the sign-in question used to come first, and a
+    # technician with a FIDO-only key plugged in read it as "my key was not found").
+    $rows = @(Get-KeyRows)
+    $lines = @()
+    $cannotType = @()
+    foreach ($r in $rows) {
+        $ser = $r.Serial; if (-not $ser) { $ser = '(not readable)' }
+        $up = $r.Pid; if (-not $up) { $up = '(not seen)' }
+        $lines += "#$($r.Num)  serial $ser  USB product $up  $($r.What)"
+        if ($r.Usb -and -not $r.Usb.Otp) { $cannotType += "#$($r.Num)" }
+    }
+    if (-not $lines.Count) { $lines = @('none yet. Plug keys in at any time: the list after the sign-in is live.') }
+    Write-Blob "Keys plugged in now ($($rows.Count))" ($lines -join "`n")
+    if ($cannotType.Count) {
+        Write-Host "  Key $($cannotType -join ', ') is SEEN, but it cannot type a code (a FIDO-only key, or its OTP part is" -ForegroundColor Yellow
+        Write-Host '  switched off), so it cannot answer the sign-in question below. Sign in with the pilot code or with a' -ForegroundColor Yellow
+        Write-Host '  key that types a code; you pick this key from the list right after.' -ForegroundColor Yellow
+    }
+}
+
 function Connect-Service {
     # One sign-in, the bench's own: it is what allows this session to enrol keys. Returns $true when
     # signed in. A session lasts 15 minutes; Assert-Session renews it between keys.
     Write-Host ''
-    Write-Host '  SIGN IN to enrol keys: plug in YOUR OWN enrolled key and HOLD it about 3 s,' -ForegroundColor Cyan
-    Write-Host '  or type the pilot code. Then unplug your key. (Enter alone = set keys up without enrolling.)' -ForegroundColor Cyan
+    Write-Host '  SIGN IN first: it is what lets this script ENROL the keys you set up. One of:' -ForegroundColor Cyan
+    Write-Host '    - HOLD (about 3 s) a key that is ALREADY enrolled to you, then unplug it;' -ForegroundColor Cyan
+    Write-Host '    - or type the pilot code;' -ForegroundColor Cyan
+    Write-Host '    - or press Enter alone to set keys up WITHOUT enrolling them.' -ForegroundColor Cyan
+    Write-Host '  The key(s) to set up are picked from a numbered list right after this.' -ForegroundColor Cyan
     for ($try = 1; $try -le 3; $try++) {
         $code = Read-Masked '  Your key or the pilot code'
         if (-not $code) { return $false }
@@ -876,8 +901,15 @@ function Connect-Service {
         if ($r.Ok -and $r.Body.session) {
             $script:Session = $r.Body.session
             $script:SessionUntil = (Get-Date).AddSeconds([int]$r.Body.expires_in)
-            $script:SignedInAs = $r.Body.name
-            Write-Host "  Signed in as $($r.Body.name). Keys set up from now on are enrolled at once." -ForegroundColor Green
+            # The service names the shared pilot code "pilot (no YubiKey)": true, but on screen it read
+            # as "no YubiKey was found". Say how the sign-in was done instead.
+            if ("$($r.Body.name)" -like 'pilot*') {
+                $script:SignedInAs = 'the pilot code'; $script:SignedInHow = 'signed in with the pilot code'
+            } else {
+                $script:SignedInAs = "$($r.Body.name)"; $script:SignedInHow = "signed in as $($r.Body.name)"
+            }
+            $how = $script:SignedInHow.Substring(0, 1).ToUpper() + $script:SignedInHow.Substring(1)
+            Write-Host "  $how. Keys set up from now on are enrolled at once." -ForegroundColor Green
             return $true
         }
         Write-Host "  Not signed in: $($r.Error)" -ForegroundColor Red
@@ -970,8 +1002,8 @@ function Invoke-OneKey {
         # Only when ykman info itself says the OTP application is "Not available", or USB product 0120.
         Write-Host '  FIDO-ONLY KEY: this model has NO one-time-code (OTP) part at all. It cannot type the start command' -ForegroundColor Yellow
         Write-Host '  or a one-time code, so the short/long press set-up does not apply to it. It is a Yubico' -ForegroundColor Yellow
-        Write-Host '  "Security Key" (FIDO2 / passkey only). At the bench, type the start command by hand and sign in' -ForegroundColor Yellow
-        Write-Host '  with the key by touch (FIDO2 sign-in). Set it aside for FIDO2 enrolment; nothing was changed.' -ForegroundColor Yellow
+        Write-Host '  "Security Key" (FIDO2 / passkey only). The bench cannot sign in with it YET: sign-in by touch' -ForegroundColor Yellow
+        Write-Host '  (FIDO2) is being built. Until then use a key that types a code. Nothing was changed.' -ForegroundColor Yellow
         return "  serial $sl  FIDO-ONLY ($label): no OTP part; FIDO2 sign-in only"
     }
     if (-not $serial -and -not $alone) {
@@ -1132,7 +1164,9 @@ try { Start-Transcript -Path $logPath | Out-Null; $transcribing = $true } catch 
 try {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     Write-Blob 'This laptop' (@(
-        "computer:   $env:COMPUTERNAME   user: $env:USERDOMAIN\$env:USERNAME   administrator: $(Test-Admin)",
+        # WindowsIdentity, not $env:USERNAME: an elevated window opened with another account's password
+        # can inherit USERNAME=SYSTEM in its environment (seen 2026-11-19) while running as that account.
+        "computer:   $env:COMPUTERNAME   user: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)   administrator: $(Test-Admin)",
         "windows:    $($os.Caption) build $($os.BuildNumber)",
         "powershell: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))",
         "service:    $Service",
@@ -1251,7 +1285,8 @@ try {
     }
     Open-Authenticator
 
-    $script:Session = $null; $script:SessionUntil = Get-Date; $script:SignedInAs = $null
+    $script:Session = $null; $script:SessionUntil = Get-Date; $script:SignedInAs = $null; $script:SignedInHow = $null
+    Show-KeysNow
     $script:Enrol = Connect-Service
     if (-not $script:Enrol) {
         Write-Host '  NOT signed in: keys will be set up but NOT enrolled, and a key that needs a RESET is left alone.' -ForegroundColor Yellow
